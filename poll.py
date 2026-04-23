@@ -221,8 +221,6 @@ def main():
     new_keys = current_keys - seen
     new_slots = [s for s in all_current if slot_key(s) in new_keys]
     
-    # TEST MODE — remove after verifying email works
-    new_slots = [{"date": "2026-05-10", "time": "19:00", "party_size": 6, "shift": "TEST"}]
     if new_slots:
         print(f"** {len(new_slots)} NEW slot(s) — sending alert **")
         try:
