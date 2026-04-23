@@ -8,7 +8,7 @@ import json
 import os
 import smtplib
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -19,12 +19,12 @@ VENUE_SLUG = "mamasfishhouserestaurantinn"
 START_DATE = "2026-05-10"   # YYYY-MM-DD
 END_DATE = "2026-05-13"     # YYYY-MM-DD (inclusive)
 PARTY_SIZES = [6, 7, 8]
-MIN_HOUR_HST = 18           # 18 = 6 PM, local restaurant time
+MIN_HOUR_HST = 18           # 18 = 6 PM
+TIME_SLOT_CENTER = "20:00"  # query centered at 8pm
+HALO_SIZE = 16              # 15-min increments; 16 = ±4hr (covers 4pm–midnight)
 
-# SevenRooms public widget endpoint
 API_URL = "https://www.sevenrooms.com/api-yoa/availability/widget/range"
 
-# Secrets from env (set in GitHub Actions → Settings → Secrets)
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ["SMTP_USER"]
@@ -44,15 +44,28 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
-def fetch_availability(party_size):
-    """Query SevenRooms widget API for date range + party size."""
+def date_range(start_iso, end_iso):
+    start = datetime.strptime(start_iso, "%Y-%m-%d").date()
+    end = datetime.strptime(end_iso, "%Y-%m-%d").date()
+    d = start
+    while d <= end:
+        yield d.strftime("%Y-%m-%d")
+        d += timedelta(days=1)
+
+
+def fetch_availability(party_size, start_date_iso):
+    """Query SevenRooms widget API for one date + party size."""
+    dt = datetime.strptime(start_date_iso, "%Y-%m-%d")
+    start_date_us = dt.strftime("%m-%d-%Y")  # SevenRooms uses MM-DD-YYYY
+
     params = {
         "venue": VENUE_SLUG,
-        "start_date": START_DATE,
-        "end_date": END_DATE,
+        "time_slot": TIME_SLOT_CENTER,
         "party_size": party_size,
+        "halo_size_interval": HALO_SIZE,
+        "start_date": start_date_us,
+        "num_days": 1,
         "channel": "SEVENROOMS_WIDGET",
-        "halo_size_interval": 0,
     }
     headers = {
         "User-Agent": (
@@ -64,44 +77,63 @@ def fetch_availability(party_size):
         "Referer": f"https://www.sevenrooms.com/reservations/{VENUE_SLUG}",
     }
     resp = httpx.get(API_URL, params=params, headers=headers, timeout=20.0)
+    if resp.status_code != 200:
+        # surface first 200 chars of body to logs for diagnosis
+        snippet = resp.text[:200].replace("\n", " ")
+        print(f"    [body snippet] {snippet}")
     resp.raise_for_status()
     return resp.json()
 
 
 def parse_hour(time_str):
-    """Return 24h hour int, or None if unparseable."""
     try:
+        if not time_str:
+            return None
         if "T" in time_str:
-            # ISO format e.g. "2026-05-10T18:30:00"
             return int(time_str.split("T")[1].split(":")[0])
         if "AM" in time_str.upper() or "PM" in time_str.upper():
-            dt = datetime.strptime(time_str.strip(), "%I:%M %p")
-            return dt.hour
-        # 24h plain e.g. "18:30"
+            return datetime.strptime(time_str.strip(), "%I:%M %p").hour
         return int(time_str.split(":")[0])
     except Exception:
         return None
 
 
-def extract_slots(payload, party_size):
+def extract_slots(payload, party_size, date_iso):
     """Walk SevenRooms response, return list of matching slot dicts."""
     slots = []
     data = payload.get("data", payload)
     avail = data.get("availability") or {}
 
     if not avail:
-        print(f"  [debug] no 'availability' key. top keys: {list(data.keys())[:8]}")
+        print(f"    [debug] no 'availability' key. top keys: {list(data.keys())[:8]}")
         return slots
 
-    for day, day_slots in avail.items():
-        if not isinstance(day_slots, list):
+    # Response may key by either MM-DD-YYYY or YYYY-MM-DD; try both
+    dt = datetime.strptime(date_iso, "%Y-%m-%d")
+    candidates = [date_iso, dt.strftime("%m-%d-%Y"), dt.strftime("%m/%d/%Y")]
+    shifts = None
+    for k in candidates:
+        if k in avail:
+            shifts = avail[k]
+            break
+    if shifts is None:
+        # nothing for this date — normal when fully booked
+        return slots
+
+    if not isinstance(shifts, list):
+        return slots
+
+    for shift in shifts:
+        if not isinstance(shift, dict):
             continue
-        for s in day_slots:
+        times = shift.get("times") or []
+        shift_name = shift.get("shift_category") or shift.get("shift_persistent_id", "")
+
+        for t in times:
             time_raw = (
-                s.get("time_iso")
-                or s.get("time")
-                or s.get("time_slot")
-                or s.get("display_time")
+                t.get("time_iso")
+                or t.get("time")
+                or t.get("display_time")
                 or ""
             )
             if not time_raw:
@@ -109,15 +141,14 @@ def extract_slots(payload, party_size):
             hour_24 = parse_hour(time_raw)
             if hour_24 is None or hour_24 < MIN_HOUR_HST:
                 continue
-            # Human-readable time
-            display = s.get("time") or time_raw
+            display = t.get("time") or time_raw
             if "T" in display:
                 display = display.split("T")[1][:5]
             slots.append({
-                "date": day,
+                "date": date_iso,
                 "time": display,
                 "party_size": party_size,
-                "shift": s.get("shift_category", "") or s.get("shift_persistent_id", ""),
+                "shift": shift_name,
             })
     return slots
 
@@ -173,17 +204,18 @@ def main():
     errors = []
 
     for party_size in PARTY_SIZES:
-        try:
-            payload = fetch_availability(party_size)
-            slots = extract_slots(payload, party_size)
-            print(f"party_size={party_size}: {len(slots)} matching slot(s)")
-            all_current.extend(slots)
-        except httpx.HTTPStatusError as e:
-            print(f"party_size={party_size}: HTTP {e.response.status_code}")
-            errors.append(f"HTTP {e.response.status_code} for party {party_size}")
-        except Exception as e:
-            print(f"party_size={party_size}: ERROR {type(e).__name__}: {e}")
-            errors.append(f"{type(e).__name__} for party {party_size}")
+        for date_iso in date_range(START_DATE, END_DATE):
+            try:
+                payload = fetch_availability(party_size, date_iso)
+                slots = extract_slots(payload, party_size, date_iso)
+                print(f"party={party_size} date={date_iso}: {len(slots)} matching slot(s)")
+                all_current.extend(slots)
+            except httpx.HTTPStatusError as e:
+                print(f"party={party_size} date={date_iso}: HTTP {e.response.status_code}")
+                errors.append(f"HTTP {e.response.status_code} party={party_size} date={date_iso}")
+            except Exception as e:
+                print(f"party={party_size} date={date_iso}: ERROR {type(e).__name__}: {e}")
+                errors.append(f"{type(e).__name__} party={party_size} date={date_iso}")
 
     current_keys = {slot_key(s) for s in all_current}
     new_keys = current_keys - seen
@@ -199,14 +231,12 @@ def main():
     else:
         print("No new slots this run.")
 
-    # State: keep current slots so reappearances re-alert
     state["seen_slots"] = sorted(current_keys)
     state["last_run"] = datetime.utcnow().isoformat(timespec='seconds') + "Z"
     save_state(state)
 
     print(f"=== Done. Known: {len(current_keys)} | new: {len(new_slots)} | errors: {len(errors)} ===")
 
-    # Exit non-zero only if every party_size failed (so GH Actions flags it)
     if errors and not all_current:
         sys.exit(2)
 
